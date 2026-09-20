@@ -10,8 +10,15 @@ workflows, not just LLM prompting.
 **Session 1 (complete):** LangGraph pipeline skeleton with toy threshold
 detection. Proves the pipeline shape end-to-end.
 
-**Planned (Sessions 2–7):**
-- MCP-backed MongoDB queries for real transaction history/context
+**Session 2 (complete):** MCP-style tool layer over a MongoDB `transactions`
+collection (mongomock, seeded with multi-payer NPP history). `ingest_transaction`
+now loads the transaction and payer history via MCP tools by `transaction_id`;
+`detect_anomaly` flags amounts far above the payer's own baseline (>=3x average
+and >=3 std devs, min 3 prior txns) instead of a fixed $50k threshold.
+Files: `mongo_db.py` (data + seed), `mcp_tools.py` (tool contract),
+`session2_langgraph_mcp.py` (graph). Set `MONGODB_URI` to use real MongoDB.
+
+**Planned (Sessions 3–7):**
 - Claude API reasoning replacing the fixed threshold (velocity,
   historical baseline, counterparty risk, pattern matching)
 - APIM AI Gateway in front of the service
@@ -63,6 +70,7 @@ compliance.
 ```bash
 pip install -r requirements.txt
 python session1_langgraph_basics.py
+python session2_langgraph_mcp.py
 ```
 
 ## Test run (Session 1)
@@ -71,3 +79,12 @@ python session1_langgraph_basics.py
 |---|---|---|
 | TXN-001 | $1,250 | clean -> `no_op` |
 | TXN-002 | $87,500 | anomalous -> `send_alert` |
+
+## Test run (Session 2)
+
+| Transaction | Scenario | Result |
+|---|---|---|
+| TXN-1001 | $210, retail payer avg ~$142 | clean -> `no_op` |
+| TXN-2001 | $61k, business payer avg ~$57k | clean -> `no_op` (fixed threshold would false-positive) |
+| TXN-3001 | $9.8k, payer avg ~$923 (10.6x) | anomalous -> `send_alert` (fixed threshold would miss) |
+| TXN-4001 | new payer, 1 prior txn | `no_op`, insufficient history |
