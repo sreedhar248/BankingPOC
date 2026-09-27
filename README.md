@@ -33,6 +33,9 @@ Files: `claude_investigator.py`, `session3_langgraph_claude.py`. Copy
 - Langfuse tracing/observability
 - Full end-to-end POC build
 
+See [VISUAL_FLOW.md](VISUAL_FLOW.md) for a plain-language diagram and a full
+technical architecture diagram of everything built so far.
+
 ## Architecture
 
 ### Flow (Session 1)
