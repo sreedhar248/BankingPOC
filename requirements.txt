@@ -1,5 +1,6 @@
 langgraph
 langchain-anthropic
+anthropic
 python-dotenv
 pymongo
 mongomock

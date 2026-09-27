@@ -18,9 +18,16 @@ and >=3 std devs, min 3 prior txns) instead of a fixed $50k threshold.
 Files: `mongo_db.py` (data + seed), `mcp_tools.py` (tool contract),
 `session2_langgraph_mcp.py` (graph). Set `MONGODB_URI` to use real MongoDB.
 
-**Planned (Sessions 3–7):**
-- Claude API reasoning replacing the fixed threshold (velocity,
-  historical baseline, counterparty risk, pattern matching)
+**Session 3 (complete):** Claude API investigation layer. Detection is
+unchanged and still deterministic (see below) — Claude is only called
+*after* `detect_anomaly` flags a transaction, to explain the flag in plain
+language and draft the alert text. Falls back to a deterministic summary
+if `ANTHROPIC_API_KEY` isn't set, so the graph runs with or without a key.
+Files: `claude_investigator.py`, `session3_langgraph_claude.py`. Copy
+`.env.example` to `.env` and add your key to enable real reasoning.
+
+**Planned (Sessions 4–7):**
+- Additional deterministic signals: velocity, counterparty risk, pattern matching
 - APIM AI Gateway in front of the service
 - Kong
 - Langfuse tracing/observability
@@ -71,7 +78,11 @@ compliance.
 pip install -r requirements.txt
 python session1_langgraph_basics.py
 python session2_langgraph_mcp.py
+python session3_langgraph_claude.py
 ```
+
+Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY` to enable Claude
+investigation in Session 3 (it falls back to a deterministic summary without one).
 
 ## Test run (Session 1)
 
@@ -88,3 +99,10 @@ python session2_langgraph_mcp.py
 | TXN-2001 | $61k, business payer avg ~$57k | clean -> `no_op` (fixed threshold would false-positive) |
 | TXN-3001 | $9.8k, payer avg ~$923 (10.6x) | anomalous -> `send_alert` (fixed threshold would miss) |
 | TXN-4001 | new payer, 1 prior txn | `no_op`, insufficient history |
+
+## Test run (Session 3)
+
+Same four scenarios as Session 2; detection results are identical (it's the
+same deterministic logic). What's new: TXN-3001's alert now comes from
+`send_alert` calling Claude to investigate and draft the message (or the
+deterministic fallback, if no API key is set).
