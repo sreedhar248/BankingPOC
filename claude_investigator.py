@@ -7,13 +7,17 @@ about a transaction *after* it has already been flagged: it explains why,
 in plain language, and drafts the alert text. The flag itself is never
 revisited here, which keeps the compliance decision auditable.
 
-If ANTHROPIC_API_KEY isn't set, investigate() falls back to a deterministic
-summary built from the flag reasons, so the graph still runs end-to-end
-without a key or API cost.
+All Claude calls go through ai_gateway.AIGateway (rate limits, metering,
+caching). If there's no ANTHROPIC_API_KEY, or the gateway throttles the call,
+investigate() falls back to a deterministic summary built from the flag
+reasons, so the alert still goes out.
 """
 
 import json
 import os
+from typing import Optional
+
+from ai_gateway import AIGateway, RateLimitExceeded, get_gateway
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 
@@ -45,34 +49,42 @@ def _fallback(transaction: dict, reasons: list[str]) -> dict:
     }
 
 
-def investigate(transaction: dict, history: list[dict], reasons: list[str]) -> dict:
+def investigate(
+    transaction: dict, history: list[dict], reasons: list[str], gateway: Optional[AIGateway] = None
+) -> dict:
     """Return {"investigation": str, "alert_message": str} for a flagged transaction."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("[claude_investigator] no ANTHROPIC_API_KEY set, using deterministic fallback")
-        return _fallback(transaction, reasons)
-
-    from anthropic import Anthropic
-
-    client = Anthropic(api_key=api_key)
+    gateway = gateway or get_gateway()
     user_content = json.dumps(
         {"transaction": transaction, "payer_history": history, "flag_reasons": reasons},
         default=str,
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=400,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
-    text = response.content[0].text
     try:
-        result = json.loads(text)
+        response = gateway.invoke(
+            transaction_id=transaction["transaction_id"],
+            reasons=reasons,
+            model=MODEL,
+            system=SYSTEM_PROMPT,
+            user_content=user_content,
+            max_tokens=400,
+        )
+    except RateLimitExceeded as exc:
+        print(f"[claude_investigator] {exc}; using deterministic fallback")
+        return _fallback(transaction, reasons)
+
+    if response.text is None:
+        print("[claude_investigator] no ANTHROPIC_API_KEY set, using deterministic fallback")
+        return _fallback(transaction, reasons)
+
+    # Claude sometimes wraps the JSON in a ```json fence despite the prompt; take the outermost {...}.
+    start, end = response.text.find("{"), response.text.rfind("}")
+    candidate = response.text[start : end + 1] if 0 <= start < end else response.text
+    try:
+        result = json.loads(candidate)
         if "investigation" in result and "alert_message" in result:
             return result
     except json.JSONDecodeError:
         pass
 
-    print("[claude_investigator] could not parse Claude response, using deterministic fallback")
+    print(f"[claude_investigator] could not parse Claude response ({response.text[:300]!r}), using deterministic fallback")
     return _fallback(transaction, reasons)
