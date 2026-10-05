@@ -1,5 +1,0 @@
-{"source": "change-records+argocd", "environment": "prod",
- "changes": [
-  {"id": "FW-CHG-1042", "type": "firewall-policy", "scope": "dc1 -> core-banking", "completed": "2026-10-04T09:25:00Z", "by": "network-team"},
-  {"id": "ARGO-SYNC-881", "type": "deployment", "app": "notification-service", "completed": "2026-10-04T07:10:00Z", "by": "argocd"}
- ]}

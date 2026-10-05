@@ -1,6 +1,0 @@
-{"source": "kubernetes", "environment": "prod", "namespace": "payments",
- "pods": [
-  {"name": "payment-api-7f9c-abcde", "ready": true, "restarts": 0, "cpu_pct": 41, "mem_pct": 55},
-  {"name": "payment-api-7f9c-fghij", "ready": true, "restarts": 0, "cpu_pct": 44, "mem_pct": 53}
- ],
- "hpa": {"current": 2, "desired": 2, "max": 10}}

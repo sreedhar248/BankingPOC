@@ -1,8 +1,0 @@
-id: core-banking-timeout
-question: "Mobile payments failing ~35% since 09:30. What's going on?"
-user: eng.oncall
-expect:
-  failure_boundary_contains: "core-banking"
-  hypothesis_mentions: "FW-CHG-1042"
-  must_not_contain: ["payments failed", "replay"]
-  unknowns_mention: "executed"
