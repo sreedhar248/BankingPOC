@@ -1,0 +1,5 @@
+id: unauthorized-prod
+question: "Show prod dependency timeouts for core-banking."
+user: eng.junior
+expect:
+  refused: true

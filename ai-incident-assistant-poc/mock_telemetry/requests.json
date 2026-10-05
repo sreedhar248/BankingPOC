@@ -1,0 +1,10 @@
+{
+  "source": "app-insights",
+  "environment": "prod",
+  "series": [
+    {"ts": "2026-10-04T09:15:00Z", "operation": "POST /payments", "channel": "mobile", "brand": "brand-a", "region": "dc1", "count": 800, "failed": 8,   "account_number": "123456789012"},
+    {"ts": "2026-10-04T09:40:00Z", "operation": "POST /payments", "channel": "mobile", "brand": "brand-a", "region": "dc1", "count": 790, "failed": 280, "account_number": "123456789012"},
+    {"ts": "2026-10-04T09:40:00Z", "operation": "POST /payments", "channel": "mobile", "brand": "brand-b", "region": "dc1", "count": 400, "failed": 140, "account_number": "998877665544"},
+    {"ts": "2026-10-04T09:40:00Z", "operation": "POST /login",    "channel": "mobile", "brand": "brand-a", "region": "dc1", "count": 1500, "failed": 3, "account_number": null}
+  ]
+}

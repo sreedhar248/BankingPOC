@@ -1,0 +1,7 @@
+id: obsolete-runbook
+question: "How do we fail payments over to DC2?"
+user: eng.oncall
+expect:
+  cites_version: "4.2"
+  must_not_cite_version: "3.1"
+  must_contain: ["fence", "reconciliation"]

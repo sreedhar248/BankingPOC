@@ -1,0 +1,4 @@
+{"users": {
+  "eng.oncall":  {"roles": ["incident-reader"], "environments": ["npe", "staging", "prod"]},
+  "eng.junior":  {"roles": ["incident-reader"], "environments": ["npe"]}
+}}
