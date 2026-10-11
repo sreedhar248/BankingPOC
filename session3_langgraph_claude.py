@@ -9,6 +9,7 @@ calls Claude to investigate *why* in plain language and draft the alert
 message, instead of just formatting the numeric reasons.
 """
 
+import math
 from statistics import mean, pstdev
 from typing import TypedDict
 
@@ -33,8 +34,14 @@ class TransactionState(TypedDict):
     history: list
     is_anomalous: bool
     reasons: list
+    signals: dict
     investigation: str
     alert_message: str
+
+
+def _finite(value: float):
+    """Round for display; undefined values (divide by zero) become None so they serialize cleanly."""
+    return round(value, 2) if math.isfinite(value) else None
 
 
 def build_graph(mcp: MCPClient):
@@ -52,17 +59,25 @@ def build_graph(mcp: MCPClient):
     def detect_anomaly(state: TransactionState) -> dict:
         amounts = [h["amount"] for h in state["history"]]
         amount = state["transaction"]["amount"]
+        signals = {
+            "amount": amount,
+            "history_count": len(amounts),
+            "min_history": MIN_HISTORY,
+            "ratio_threshold": RATIO_THRESHOLD,
+            "zscore_threshold": ZSCORE_THRESHOLD,
+        }
 
         if len(amounts) < MIN_HISTORY:
             reasons = [f"insufficient history ({len(amounts)} prior txns) — no baseline check possible"]
             print(f"[detect] {reasons[0]}")
-            return {"is_anomalous": False, "reasons": reasons}
+            return {"is_anomalous": False, "reasons": reasons, "signals": signals}
 
         avg = mean(amounts)
         std = pstdev(amounts)
         ratio = amount / avg if avg else float("inf")
         z = (amount - avg) / std if std else float("inf")
         print(f"[detect] baseline avg=${avg:,.2f} std=${std:,.2f} -> ratio={ratio:.1f}x z={z:.1f}")
+        signals.update(avg=_finite(avg), std=_finite(std), ratio=_finite(ratio), z_score=_finite(z))
 
         if ratio >= RATIO_THRESHOLD and z >= ZSCORE_THRESHOLD:
             return {
@@ -71,8 +86,9 @@ def build_graph(mcp: MCPClient):
                     f"amount ${amount:,.2f} is {ratio:.1f}x payer average ${avg:,.2f} "
                     f"({z:.1f} std devs above, n={len(amounts)})"
                 ],
+                "signals": signals,
             }
-        return {"is_anomalous": False, "reasons": ["consistent with payer history"]}
+        return {"is_anomalous": False, "reasons": ["consistent with payer history"], "signals": signals}
 
     def route_after_detection(state: TransactionState) -> str:
         return "send_alert" if state["is_anomalous"] else "no_op"
@@ -119,7 +135,7 @@ if __name__ == "__main__":
         print(f"\n--- {txn_id}: {label} ---")
         with tracing.trace(name=txn_id, tags=[label], input={"transaction_id": txn_id}) as span:
             result = app.invoke({"transaction_id": txn_id}, config={"callbacks": tracing.callbacks()})
-            span.update(output={"is_anomalous": result["is_anomalous"], "reasons": result["reasons"]})
+            span.update(output={k: result[k] for k in ("is_anomalous", "reasons", "signals")})
         ok = result["is_anomalous"] == expected
         failures += not ok
         print(f"Result: is_anomalous={result['is_anomalous']} (expected {expected}) {'PASS' if ok else 'FAIL'}")

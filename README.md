@@ -202,8 +202,8 @@ What Langfuse shows, versus what you had before:
 
 | Langfuse shows | Earlier equivalent |
 |---|---|
-| One trace per transaction: name = `transaction_id`, tag = scenario label, root input/output (`is_anomalous`, `reasons`) | The `--- TXN-xxxx: label ---` header and `Result: is_anomalous=...` print lines |
-| One span per graph node with its timing and the state it returned | The `[ingest]`, `[detect]`, `[send_alert]`, `[no_op]` print lines (no timing existed) |
+| One trace per transaction: name = `transaction_id`, tag = scenario label, root input/output (`is_anomalous`, `reasons`, `signals`) | The `--- TXN-xxxx: label ---` header and `Result: is_anomalous=...` print lines |
+| One span per graph node with its timing and the state it returned. `detect_anomaly` returns `signals`: `avg`, `std`, `ratio`, `z_score`, `history_count` and the thresholds, for clean and anomalous transactions alike | The `[ingest]`, `[detect]`, `[send_alert]`, `[no_op]` print lines (no timing existed; the baseline numbers were only in the `[detect]` print) |
 | `ai-gateway` span metadata: `gateway_status`, `input_tokens`, `output_tokens`, `estimated_input_tokens`, `cost_usd`, `limit`, `retry_after_seconds` | The `[gateway] ok / cache_hit / throttled / no_api_key` print lines and `gateway.log` entries |
 | `claude-call` generation: model, full system + user prompt, full response, token usage, cost, latency | The `[gateway] ok ... in= out= cost=` line, which had tokens and cost only. The prompt and response were not visible anywhere. |
 | Cost and token totals across traces (Langfuse dashboards) | `gateway.usage_summary()`, per process only |
