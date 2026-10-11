@@ -15,6 +15,7 @@ from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
+import tracing
 from claude_investigator import investigate
 from mcp_tools import MCPClient, MongoTransactionsServer
 from mongo_db import get_collection
@@ -116,9 +117,12 @@ if __name__ == "__main__":
     failures = 0
     for txn_id, label, expected in scenarios:
         print(f"\n--- {txn_id}: {label} ---")
-        result = app.invoke({"transaction_id": txn_id})
+        with tracing.trace(name=txn_id, tags=[label], input={"transaction_id": txn_id}) as span:
+            result = app.invoke({"transaction_id": txn_id}, config={"callbacks": tracing.callbacks()})
+            span.update(output={"is_anomalous": result["is_anomalous"], "reasons": result["reasons"]})
         ok = result["is_anomalous"] == expected
         failures += not ok
         print(f"Result: is_anomalous={result['is_anomalous']} (expected {expected}) {'PASS' if ok else 'FAIL'}")
 
+    tracing.flush()
     raise SystemExit(1 if failures else 0)

@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import tracing
+
 WINDOW_SECONDS = 60
 
 # Placeholder public list prices in USD per million tokens (input, output).
@@ -170,7 +172,29 @@ class AIGateway:
 
     # ---- entry point -----------------------------------------------------
 
-    def invoke(
+    def invoke(self, **request) -> GatewayResult:
+        """
+        Run one request through the policy pipeline (see _invoke for the arguments),
+        inside an "ai-gateway" Langfuse span carrying the gateway status as metadata.
+        Throttling is an expected outcome, so it is re-raised after the span closes
+        instead of being recorded as a span error.
+        """
+        result, throttled = None, None
+        with tracing.observation("ai-gateway", metadata={"transaction_id": request["transaction_id"]}) as span:
+            try:
+                result = self._invoke(**request)
+            except RateLimitExceeded as exc:
+                throttled = exc
+                span.update(level="WARNING", status_message=str(exc))
+            entry = self.log[-1]
+            span.update(
+                metadata={"gateway_status": entry["status"], **{k: v for k, v in entry.items() if k != "status"}}
+            )
+        if throttled:
+            raise throttled
+        return result
+
+    def _invoke(
         self, *, transaction_id: str, reasons: list, model: str, system: str, user_content: str, max_tokens: int
     ) -> GatewayResult:
         now = self._clock()
@@ -195,7 +219,26 @@ class AIGateway:
             )
             raise
 
-        result = self._backend(model=model, system=system, user_content=user_content, max_tokens=max_tokens)
+        # Recorded here (not inside AnthropicBackend) so any backend is traced, e.g. a future APIM one.
+        # Cost is our placeholder estimate, passed explicitly so Langfuse shows it even for models
+        # missing from its price table.
+        with tracing.observation(
+            "claude-call",
+            as_type="generation",
+            model=model,
+            input=[{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            model_parameters={"max_tokens": max_tokens},
+        ) as generation:
+            result = self._backend(model=model, system=system, user_content=user_content, max_tokens=max_tokens)
+            generation.update(
+                output=result.text,
+                usage_details={"input": result.input_tokens, "output": result.output_tokens},
+                cost_details={
+                    "input": estimate_cost(model, result.input_tokens, 0),
+                    "output": estimate_cost(model, 0, result.output_tokens),
+                    "total": estimate_cost(model, result.input_tokens, result.output_tokens),
+                },
+            )
 
         done = self._clock()
         self._request_times.append(done)

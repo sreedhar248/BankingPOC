@@ -31,10 +31,14 @@ of the Claude call: request and token rate limits, per-call metering/logging,
 and response caching. `claude_investigator.investigate()` now routes through
 it. See [Session 4: simulated APIM AI Gateway](#session-4-simulated-apim-ai-gateway).
 
-**Planned (Sessions 5–7):**
+**Session 6 (complete):** Langfuse tracing. Each scenario is one trace
+(graph nodes, the gateway, and the Claude call as a generation with token
+counts). Entirely optional: with no `LANGFUSE_*` keys the code runs exactly as
+before. See [Session 6: Langfuse tracing](#session-6-langfuse-tracing).
+
+**Still planned:**
 - Additional deterministic signals: velocity, counterparty risk, pattern matching
 - Kong
-- Langfuse tracing/observability
 - Full end-to-end POC build
 
 See [VISUAL_FLOW.md](VISUAL_FLOW.md) for a plain-language diagram and a full
@@ -81,7 +85,10 @@ compliance.
 
 ## Setup
 
+Requires **Python 3.10+** (the current Langfuse SDK does not support 3.9).
+
 ```bash
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python session1_langgraph_basics.py
 python session2_langgraph_mcp.py
@@ -156,3 +163,80 @@ no API calls and doesn't wait a real minute:
 The Session 3 scenarios run unchanged through the gateway against the real
 Claude API (TXN-3001: ~1,100 input / ~220 output tokens, about $0.007 at the
 placeholder Sonnet rates).
+
+## Session 6: Langfuse tracing
+
+Tracing is wired through `tracing.py`, which is a no-op unless
+`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` are all
+set (copy them into `.env`; use the base URL of the region your project was
+created in, e.g. `https://us.cloud.langfuse.com`). Without them nothing is
+imported or sent, and `test_ai_gateway.py` runs offline.
+
+How it fits together:
+
+- `session3_langgraph_claude.py` wraps each scenario in one root span named
+  after the `transaction_id`, tagged with the scenario label, and passes
+  Langfuse's LangChain `CallbackHandler` to `app.invoke()`. Every graph node
+  becomes a span. `langfuse.flush()` runs before exit so buffered events are sent.
+- `ai_gateway.py` opens an `ai-gateway` span around each request, with the
+  gateway status (`ok` / `cache_hit` / `throttled` / `no_api_key`) as metadata.
+  Around the backend call it records a `claude-call` **generation** with model,
+  input messages, output, `usage_details` and `cost_details`. The raw Anthropic
+  SDK call is invisible to the LangChain callback handler, and recording it in
+  the gateway also covers any future backend (e.g. a real APIM endpoint).
+- A throttled call is recorded as a `WARNING` span, not an error, since it is an
+  expected, handled outcome.
+
+Resulting trace for TXN-3001 (verified in the project):
+
+```
+TXN-3001 (root span)
+  LangGraph
+    ingest_transaction / detect_anomaly / route_after_detection
+    send_alert
+      ai-gateway            gateway_status=ok
+        claude-call         model, messages, output, 1132 in / 207 out tokens, $0.0065
+```
+
+What Langfuse shows, versus what you had before:
+
+| Langfuse shows | Earlier equivalent |
+|---|---|
+| One trace per transaction: name = `transaction_id`, tag = scenario label, root input/output (`is_anomalous`, `reasons`) | The `--- TXN-xxxx: label ---` header and `Result: is_anomalous=...` print lines |
+| One span per graph node with its timing and the state it returned | The `[ingest]`, `[detect]`, `[send_alert]`, `[no_op]` print lines (no timing existed) |
+| `ai-gateway` span metadata: `gateway_status`, `input_tokens`, `output_tokens`, `estimated_input_tokens`, `cost_usd`, `limit`, `retry_after_seconds` | The `[gateway] ok / cache_hit / throttled / no_api_key` print lines and `gateway.log` entries |
+| `claude-call` generation: model, full system + user prompt, full response, token usage, cost, latency | The `[gateway] ok ... in= out= cost=` line, which had tokens and cost only. The prompt and response were not visible anywhere. |
+| Cost and token totals across traces (Langfuse dashboards) | `gateway.usage_summary()`, per process only |
+| Throttled call: `WARNING` span with the `429 ...` message | `[gateway] throttled` plus the `[claude_investigator] ... using deterministic fallback` print |
+
+The print lines and `gateway.log` are unchanged and still work with tracing off.
+
+**Notes:**
+
+- Cost in Langfuse is the gateway's placeholder estimate (`PRICING_PER_MTOK`),
+  passed explicitly. It is not Langfuse's own model price table or your bill.
+- To read traces back via API on a new Langfuse project, use
+  `GET /api/public/v2/observations` (SDK: `api.observations.get_many`). The
+  older `/api/public/traces` endpoint returns 410 for projects created on or
+  after 2026-09-16. Trace name and tags are in the `trace_context` field group.
+
+**Known gaps:**
+
+- **No sampling:** every run is traced.
+- **No PII masking:** full prompts and responses (payer names, amounts, payees)
+  are sent to Langfuse cloud. The data here is synthetic. Real NPP data would
+  need a masking function on the client and a data-residency review first.
+- **No evals or scores:** nothing rates the quality of Claude's investigation
+  text yet.
+- **Fallbacks are not observed:** a Claude reply that fails JSON parsing, or the
+  no-key fallback, shows only as the final alert text and a print line. Only the
+  gateway status is on the span.
+- Traces cover the Session 3 entry point only. Sessions 1 and 2 are untraced.
+
+### Test run (Session 6)
+
+| Check | Result |
+|---|---|
+| `python test_ai_gateway.py` (section 5, fake Langfuse client, no network) | span and generation attributes verified for `ok`, `cache_hit`, `throttled`, `no_api_key`; throttling not recorded as an error |
+| `session3_langgraph_claude.py` with all keys blank | identical behaviour to Session 4, no errors, `langfuse` never imported |
+| `session3_langgraph_claude.py` with keys, 4 scenarios | 4 traces in the Langfuse project; TXN-3001 shows the Claude generation with token counts |

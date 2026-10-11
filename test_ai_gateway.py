@@ -4,9 +4,17 @@ no API calls, no waiting. Run: python test_ai_gateway.py
 """
 
 import json
+import os
+from contextlib import contextmanager
 
+# Keep this test offline even on a machine with real Langfuse keys exported.
+for _name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"):
+    os.environ.pop(_name, None)
+
+import langfuse
+import tracing
 from ai_gateway import AIGateway, BackendResult
-from claude_investigator import investigate
+from claude_investigator import MODEL, investigate
 
 
 class FakeClock:
@@ -90,6 +98,68 @@ gw = AIGateway(backend, clock=FakeClock())
 result = investigate(txn(1), [], ["big jump"], gateway=gw)
 check("deterministic fallback returned, backend never called", backend.calls == 0 and result["investigation"] == "big jump")
 check("logged as no_api_key", gw.log[-1]["status"] == "no_api_key")
+
+print("\n=== 5. Langfuse tracing: off without keys, correct observations with a fake client ===")
+check("tracing is disabled when no LANGFUSE_* keys are set", not tracing.enabled() and tracing.callbacks() == [])
+
+
+class Recorded:
+    def __init__(self, name, as_type, attrs):
+        self.name, self.as_type, self.attrs, self.error = name, as_type, dict(attrs), None
+
+    def update(self, **kwargs):
+        self.attrs.update(kwargs)
+
+
+class RecordingClient:
+    def __init__(self):
+        self.observations = []
+
+    @contextmanager
+    def start_as_current_observation(self, *, name, as_type="span", **attrs):
+        obs = Recorded(name, as_type, attrs)
+        self.observations.append(obs)
+        try:
+            yield obs
+        except BaseException as exc:
+            obs.error = exc
+            raise
+
+
+client = RecordingClient()
+real_get_client, real_enabled = langfuse.get_client, tracing.enabled
+langfuse.get_client, tracing.enabled = (lambda: client), (lambda: True)
+try:
+    def observed(gateway, n, reasons):
+        before = len(client.observations)
+        investigate(txn(n), [], reasons, gateway=gateway)
+        return client.observations[before:]
+
+    gw = AIGateway(FakeBackend(), requests_per_minute=1, tokens_per_minute=1_000_000, clock=FakeClock())
+    span, generation = observed(gw, 1, ["big jump"])
+    check("ok: gateway span + claude-call generation", (span.name, generation.name) == ("ai-gateway", "claude-call"))
+    check("ok: span metadata carries gateway_status=ok and token counts",
+          span.attrs["metadata"]["gateway_status"] == "ok" and span.attrs["metadata"]["input_tokens"] == 300)
+    check("ok: generation has model, input messages, output, usage",
+          generation.as_type == "generation" and generation.attrs["model"] == MODEL
+          and generation.attrs["input"][0]["role"] == "system"
+          and generation.attrs["output"].count("FAKE-LLM") >= 1
+          and generation.attrs["usage_details"] == {"input": 300, "output": 100})
+    check("ok: generation carries a positive cost", generation.attrs["cost_details"]["total"] > 0)
+
+    (span,) = observed(gw, 1, ["big jump"])
+    check("cache_hit: span only, no generation", span.attrs["metadata"]["gateway_status"] == "cache_hit")
+
+    (span,) = observed(gw, 1, ["different reason"])
+    check("throttled: span only, gateway_status=throttled, level=WARNING",
+          span.attrs["metadata"]["gateway_status"] == "throttled" and span.attrs["level"] == "WARNING")
+    check("throttled: not recorded as a span error", span.error is None)
+
+    gw = AIGateway(FakeBackend(available=False), clock=FakeClock())
+    (span,) = observed(gw, 2, ["big jump"])
+    check("no_api_key: span only, gateway_status=no_api_key", span.attrs["metadata"]["gateway_status"] == "no_api_key")
+finally:
+    langfuse.get_client, tracing.enabled = real_get_client, real_enabled
 
 print(f"\n{'ALL PASSED' if not failures else f'{failures} FAILED'}")
 raise SystemExit(1 if failures else 0)
