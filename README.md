@@ -36,6 +36,11 @@ it. See [Session 4: simulated APIM AI Gateway](#session-4-simulated-apim-ai-gate
 counts). Entirely optional: with no `LANGFUSE_*` keys the code runs exactly as
 before. See [Session 6: Langfuse tracing](#session-6-langfuse-tracing).
 
+**Session 7 (complete):** the agent is now a deployable service. The graph moved
+to `agent.py` (the session scripts are thin runners), `api.py` exposes it over
+HTTP with API-key auth, and a `Dockerfile` + `docker-compose.yml` package it. See
+[Session 7: deployable service](#session-7-deployable-service).
+
 **Still planned:**
 - Additional deterministic signals: velocity, counterparty risk, pattern matching
 - Kong
@@ -93,7 +98,7 @@ pip install -r requirements.txt
 python session1_langgraph_basics.py
 python session2_langgraph_mcp.py
 python session3_langgraph_claude.py
-python test_ai_gateway.py   # Session 4 gateway tests (no API calls)
+pytest                      # all tests; keyless and offline (no API calls)
 ```
 
 Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY` to enable Claude
@@ -143,12 +148,13 @@ to a real instance as configuration rather than a rewrite.
 
 **Known gaps vs real APIM:** counters and cache are in-process (APIM uses a
 distributed store, so limits hold across instances); there is a single
-global bucket rather than per-caller keys; and there is no authentication
-policy (`validate-jwt` / subscription keys) yet.
+global bucket rather than per-caller keys. Caller authentication, originally a
+gap here, is added in Session 7 as a shared-key check on the API (APIM would
+replace it with subscription keys / `validate-jwt`).
 
 ### Test run (Session 4)
 
-`python test_ai_gateway.py` uses a fake backend and a fake clock, so it makes
+`pytest test_ai_gateway.py` uses a fake backend and a fake clock, so it makes
 no API calls and doesn't wait a real minute:
 
 | Scenario | Result |
@@ -170,7 +176,7 @@ Tracing is wired through `tracing.py`, which is a no-op unless
 `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` are all
 set (copy them into `.env`; use the base URL of the region your project was
 created in, e.g. `https://us.cloud.langfuse.com`). Without them nothing is
-imported or sent, and `test_ai_gateway.py` runs offline.
+imported or sent, and the tests run offline.
 
 How it fits together:
 
@@ -237,6 +243,130 @@ The print lines and `gateway.log` are unchanged and still work with tracing off.
 
 | Check | Result |
 |---|---|
-| `python test_ai_gateway.py` (section 5, fake Langfuse client, no network) | span and generation attributes verified for `ok`, `cache_hit`, `throttled`, `no_api_key`; throttling not recorded as an error |
+| `pytest test_ai_gateway.py` (tracing tests, fake Langfuse client, no network) | span and generation attributes verified for `ok`, `cache_hit`, `throttled`, `no_api_key`; throttling not recorded as an error |
 | `session3_langgraph_claude.py` with all keys blank | identical behaviour to Session 4, no errors, `langfuse` never imported |
 | `session3_langgraph_claude.py` with keys, 4 scenarios | 4 traces in the Langfuse project; TXN-3001 shows the Claude generation with token counts |
+
+## Session 7: deployable service
+
+The graph now lives in `agent.py` and is served over HTTP by `api.py` (FastAPI).
+`session3_langgraph_claude.py` is a thin runner over the same graph; sessions 1 and 2
+remain standalone teaching scripts.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /healthz` | none | Liveness probe: `{"status": "ok"}` |
+| `POST /analyze` | `X-API-Key` | `{"transaction_id": "..."}` returns `is_anomalous`, `reasons`, `signals`, `investigation`, `alert_message`, `gateway_status` |
+
+`investigation`, `alert_message` and `gateway_status` are `null` for transactions that
+were not flagged (Claude is never called for them). `gateway_status` is
+`ok` / `cache_hit` / `no_api_key` / `throttled`. Status codes: `401` missing or wrong key,
+`404` unknown `transaction_id`, `422` malformed body, `429` see below.
+
+**Auth.** `API_KEYS` is a comma-separated list; a request must send one as `X-API-Key`.
+If `API_KEYS` is empty or unset, every request is rejected (fail closed). Comparison is constant-time.
+
+**Throttling.** If the AI gateway throttles the Claude call, the default is to still return the
+deterministic fallback alert (HTTP 200, `gateway_status: "throttled"`), because a missed
+compliance alert is worse than a less detailed one. Set `THROTTLE_FALLBACK=false` to return
+`429` with a `Retry-After` header instead.
+
+### Run it
+
+Locally:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # make a key, put it in .env as API_KEYS=
+uvicorn api:app --env-file .env
+```
+
+Docker (keys come from the environment at run time and are never baked into the image):
+
+```bash
+docker build -t banking-poc .
+docker run --rm -p 8000:8000 -e API_KEYS=<your-key> -e ANTHROPIC_API_KEY=<optional> banking-poc
+```
+
+Compose (reads `.env` in this folder; refuses to start if `API_KEYS` is unset):
+
+```bash
+docker compose up --build                       # API with the in-memory demo data
+docker compose --profile mongo up --build       # plus a real MongoDB service
+```
+
+For the `mongo` profile, set `MONGODB_URI=mongodb://mongo:27017` and `SEED_DEMO_DATA=true` in `.env`.
+`SEED_DEMO_DATA` only loads the demo data into an empty collection.
+
+Tests (keyless and offline, whatever is in your `.env` or shell):
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+### Example calls
+
+```bash
+curl http://localhost:8000/healthz
+
+curl -X POST http://localhost:8000/analyze \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"transaction_id": "TXN-3001"}'
+```
+
+Response for TXN-3001 (no Anthropic key configured, so the deterministic fallback text):
+
+```json
+{
+  "is_anomalous": true,
+  "reasons": ["amount $9,800.00 is 10.6x payer average $923.33 (43.0 std devs above, n=6)"],
+  "signals": {"amount": 9800.0, "history_count": 6, "avg": 923.33, "std": 206.61, "ratio": 10.61, "z_score": 42.96, "...": "..."},
+  "investigation": "amount $9,800.00 is 10.6x payer average $923.33 (43.0 std devs above, n=6)",
+  "alert_message": "ALERT: transaction TXN-3001 ($9,800.00) flagged as anomalous \u2014 amount $9,800.00 is 10.6x ...",
+  "gateway_status": "no_api_key"
+}
+```
+
+With an `ANTHROPIC_API_KEY`, `investigation` and `alert_message` are Claude's text and
+`gateway_status` is `ok`; repeating the request returns `cache_hit`. Other outcomes:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8000/analyze -H "Content-Type: application/json" -d '{"transaction_id":"TXN-3001"}'                          # 401 no key
+curl -s -w " %{http_code}\n" -X POST localhost:8000/analyze -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" -d '{"transaction_id":"NOPE"}'   # 404
+```
+
+### What each part maps to in production (AKS/EKS + APIM)
+
+| Here | Production equivalent | Notes |
+|---|---|---|
+| `X-API-Key` checked against `API_KEYS` | APIM subscription keys (`Ocp-Apim-Subscription-Key`), or the `validate-jwt` inbound policy for Entra ID / OAuth tokens | APIM gives per-caller identity, revocation and quotas. Once APIM fronts the service, restrict the backend to APIM traffic (private networking, mTLS, or a header set by APIM) or the bypass defeats the check. Keep a key check as defence in depth if you like. |
+| `401` + `WWW-Authenticate` | APIM returns `401` for a missing or invalid subscription key or token | Same client-visible contract. |
+| `429` + `Retry-After` (`THROTTLE_FALLBACK=false`) | `rate-limit-by-key` / `llm-token-limit` returning `429` at the gateway | See the Session 4 table. Here the limit protects only the Claude call and is enforced inside the service. |
+| `GET /healthz` | Kubernetes `livenessProbe` / `readinessProbe` (`httpGet`), plus the APIM backend or load-balancer probe | Liveness only: it does not check MongoDB or Claude, so a real readiness probe would need a dependency check. |
+| `Dockerfile` (non-root uid 10001, no secrets, runtime files only) | Image in ACR / ECR; pod `securityContext` with `runAsNonRoot: true`, `runAsUser: 10001`, `readOnlyRootFilesystem: true` | The healthcheck in the Dockerfile is ignored by Kubernetes; use probes. |
+| `docker-compose.yml` `environment:` | Deployment manifest or Helm chart: `ConfigMap` for settings, `Secret` for keys | `restart: unless-stopped` becomes the Deployment's self-healing. |
+| `ANTHROPIC_API_KEY`, `API_KEYS` from `.env` | Kubernetes `Secret`, ideally synced from Azure Key Vault (CSI Secrets Store driver) or AWS Secrets Manager | Never in the image or the manifest in plain text. |
+| Compose `mongo` service | Managed MongoDB: Atlas, Azure Cosmos DB for MongoDB, or Amazon DocumentDB, with `MONGODB_URI` from a Secret | `mongo:7` with a local volume is for development only. |
+| One uvicorn worker; gateway counters and cache in process memory | Replicas behind a Service / Ingress, scaled by HPA | N replicas means N separate rate-limit counters and caches, so the effective limit is N times higher. APIM's distributed counters (or a shared Redis) fix that. |
+| TLS is not handled here | TLS terminates at the Ingress or APIM | The service listens on plain HTTP inside the cluster. |
+
+**Known gaps:**
+
+- **Shared static keys:** no per-caller identity, quotas or revocation without changing `API_KEYS` and restarting.
+- **`/analyze` itself is not rate limited.** The gateway limits Claude calls only. A caller can still drive MongoDB and the detection logic as fast as the service will go.
+- **`/docs` and `/openapi.json` are served without auth** (FastAPI defaults).
+- **No Langfuse tracing in the API yet.** Tracing still works from `session3_langgraph_claude.py`; the container does not receive `LANGFUSE_*`.
+- **Synchronous requests:** a flagged transaction holds a worker thread for the duration of the Claude call.
+- **Image size:** about 400 MB, mostly LangChain and Langfuse dependencies that this service barely uses.
+- **Default data is in memory:** the demo data resets on every restart unless `MONGODB_URI` is set.
+
+### Test run (Session 7)
+
+| Check | Result |
+|---|---|
+| `pytest` (keyless, offline) | 26 tests pass: auth (missing, wrong, second key, fail-closed), clean and insufficient-history verdicts, anomalous with and without a Claude key, cache hit, 404, 422, throttle fallback, 429 with `Retry-After`, plus the existing gateway and tracing tests |
+| `docker build` | non-root `appuser`, runtime modules only, no `.env` in the image |
+| `docker run`, then `curl /analyze` for TXN-3001 | `200`, `is_anomalous: true`, `gateway_status: "no_api_key"`; no key `401`; unknown id `404`; healthcheck `healthy` |
+| 60 parallel requests against the container | 40 `200`, 20 expected `404`, no `500`s, no tracebacks |
+| `docker compose --profile mongo up` | 25 demo documents seeded into real MongoDB, TXN-3001 anomalous through it, restart did not re-seed |
+| `docker compose up` with a real Anthropic key | TXN-3001 `gateway_status: "ok"` with Claude's investigation, repeat call `cache_hit` |

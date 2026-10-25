@@ -1,7 +1,8 @@
 """
 Data layer for the transactions collection.
 
-Set MONGODB_URI to use a real MongoDB/Atlas instance; otherwise an in-memory
+Set MONGODB_URI to use a real MongoDB/Atlas instance (add SEED_DEMO_DATA=true to
+load the demo data into an empty collection); otherwise an in-memory
 mongomock database is created and seeded. Both expose the same pymongo
 Collection API, so nothing downstream changes when you swap.
 """
@@ -82,7 +83,11 @@ def get_collection():
     uri = os.environ.get("MONGODB_URI")
     if uri:
         from pymongo import MongoClient
-        return MongoClient(uri)[DB_NAME][COLLECTION_NAME]
+        collection = MongoClient(uri)[DB_NAME][COLLECTION_NAME]
+        # Opt-in and only into an empty collection, so a real database is never seeded by accident.
+        if os.environ.get("SEED_DEMO_DATA", "").lower() == "true" and collection.count_documents({}) == 0:
+            seed(collection)
+        return collection
 
     import mongomock
     collection = mongomock.MongoClient()[DB_NAME][COLLECTION_NAME]

@@ -12,13 +12,16 @@ estimated up front to decide admission, then actual prompt + completion tokens
 (as reported by the backend) are counted against the window afterwards.
 
 State is in-process only. Real APIM keeps these counters/caches in a
-distributed store and keys them per caller (subscription, IP, ...).
+distributed store and keys them per caller (subscription, IP, ...). A lock
+guards the counters so concurrent requests (e.g. from the HTTP API's thread
+pool) are safe; it is never held across the backend call.
 """
 
 import hashlib
 import json
 import math
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -65,6 +68,7 @@ class BackendResult:
 class GatewayResult:
     text: Optional[str]  # None only when status == "no_api_key"
     status: str          # "ok" | "cache_hit" | "no_api_key"
+    record: Optional[dict] = None  # this request's own log entry
 
 
 class AnthropicBackend:
@@ -106,6 +110,7 @@ class AIGateway:
         self._token_events: deque = deque()  # (timestamp, tokens)
         self._cache: dict = {}               # key -> (expires_at, text)
         self.log: list = []
+        self._lock = threading.Lock()
 
     # ---- policies --------------------------------------------------------
 
@@ -137,7 +142,7 @@ class AIGateway:
 
     # ---- logging / metering ---------------------------------------------
 
-    def _record(self, status: str, transaction_id: str, **fields) -> None:
+    def _record(self, status: str, transaction_id: str, **fields) -> dict:
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "transaction_id": transaction_id,
@@ -158,6 +163,7 @@ class AIGateway:
         else:
             detail = "no API key configured, backend not called"
         print(f"[gateway] {status:<10} txn={transaction_id} {detail}")
+        return entry
 
     def usage_summary(self) -> dict:
         ok = [e for e in self.log if e["status"] == "ok"]
@@ -186,7 +192,7 @@ class AIGateway:
             except RateLimitExceeded as exc:
                 throttled = exc
                 span.update(level="WARNING", status_message=str(exc))
-            entry = self.log[-1]
+            entry = throttled.record if throttled else result.record
             span.update(
                 metadata={"gateway_status": entry["status"], **{k: v for k, v in entry.items() if k != "status"}}
             )
@@ -202,19 +208,18 @@ class AIGateway:
         key = self._cache_key(transaction_id, reasons)
         cached = self._cache.get(key)
         if cached and now < cached[0]:
-            self._record("cache_hit", transaction_id)
-            return GatewayResult(cached[1], "cache_hit")
+            return GatewayResult(cached[1], "cache_hit", self._record("cache_hit", transaction_id))
         self._cache.pop(key, None)
 
         if not self._backend.available():
-            self._record("no_api_key", transaction_id)
-            return GatewayResult(None, "no_api_key")
+            return GatewayResult(None, "no_api_key", self._record("no_api_key", transaction_id))
 
         estimated_input = estimate_tokens(system + user_content)
         try:
-            self._check_limits(now, estimated_input)
+            with self._lock:
+                self._check_limits(now, estimated_input)
         except RateLimitExceeded as exc:
-            self._record(
+            exc.record = self._record(
                 "throttled", transaction_id, limit=exc.limit_name, retry_after_seconds=exc.retry_after
             )
             raise
@@ -241,10 +246,11 @@ class AIGateway:
             )
 
         done = self._clock()
-        self._request_times.append(done)
-        self._token_events.append((done, result.input_tokens + result.output_tokens))
-        self._cache[key] = (done + self.cache_ttl_seconds, result.text)
-        self._record(
+        with self._lock:
+            self._request_times.append(done)
+            self._token_events.append((done, result.input_tokens + result.output_tokens))
+            self._cache[key] = (done + self.cache_ttl_seconds, result.text)
+        record = self._record(
             "ok",
             transaction_id,
             estimated_input_tokens=estimated_input,
@@ -252,7 +258,7 @@ class AIGateway:
             output_tokens=result.output_tokens,
             cost_usd=estimate_cost(model, result.input_tokens, result.output_tokens),
         )
-        return GatewayResult(result.text, "ok")
+        return GatewayResult(result.text, "ok", record)
 
 
 _default_gateway: Optional[AIGateway] = None

@@ -2,7 +2,7 @@
 Claude-based investigation and alert drafting for flagged transactions.
 
 Detection (is this transaction anomalous?) stays deterministic — see
-detect_anomaly in session3_langgraph_claude.py. This module only reasons
+detect_anomaly in agent.py. This module only reasons
 about a transaction *after* it has already been flagged: it explains why,
 in plain language, and drafts the alert text. The flag itself is never
 revisited here, which keeps the compliance decision auditable.
@@ -10,7 +10,8 @@ revisited here, which keeps the compliance decision auditable.
 All Claude calls go through ai_gateway.AIGateway (rate limits, metering,
 caching). If there's no ANTHROPIC_API_KEY, or the gateway throttles the call,
 investigate() falls back to a deterministic summary built from the flag
-reasons, so the alert still goes out.
+reasons, so the alert still goes out (unless the caller opts out of the
+throttle fallback, in which case RateLimitExceeded propagates).
 """
 
 import json
@@ -38,9 +39,10 @@ Respond with ONLY a JSON object of the form:
 {"investigation": "...", "alert_message": "..."}"""
 
 
-def _fallback(transaction: dict, reasons: list[str]) -> dict:
+def _fallback(transaction: dict, reasons: list[str], gateway_status: str) -> dict:
     joined = "; ".join(reasons)
     return {
+        "gateway_status": gateway_status,
         "investigation": joined,
         "alert_message": (
             f"ALERT: transaction {transaction['transaction_id']} "
@@ -50,9 +52,16 @@ def _fallback(transaction: dict, reasons: list[str]) -> dict:
 
 
 def investigate(
-    transaction: dict, history: list[dict], reasons: list[str], gateway: Optional[AIGateway] = None
+    transaction: dict,
+    history: list[dict],
+    reasons: list[str],
+    gateway: Optional[AIGateway] = None,
+    fallback_on_throttle: bool = True,
 ) -> dict:
-    """Return {"investigation": str, "alert_message": str} for a flagged transaction."""
+    """
+    Return {"investigation", "alert_message", "gateway_status"} for a flagged transaction.
+    gateway_status is the gateway's outcome: ok / cache_hit / no_api_key / throttled.
+    """
     gateway = gateway or get_gateway()
     user_content = json.dumps(
         {"transaction": transaction, "payer_history": history, "flag_reasons": reasons},
@@ -69,12 +78,14 @@ def investigate(
             max_tokens=400,
         )
     except RateLimitExceeded as exc:
+        if not fallback_on_throttle:
+            raise
         print(f"[claude_investigator] {exc}; using deterministic fallback")
-        return _fallback(transaction, reasons)
+        return _fallback(transaction, reasons, "throttled")
 
     if response.text is None:
         print("[claude_investigator] no ANTHROPIC_API_KEY set, using deterministic fallback")
-        return _fallback(transaction, reasons)
+        return _fallback(transaction, reasons, response.status)
 
     # Claude sometimes wraps the JSON in a ```json fence despite the prompt; take the outermost {...}.
     start, end = response.text.find("{"), response.text.rfind("}")
@@ -82,9 +93,9 @@ def investigate(
     try:
         result = json.loads(candidate)
         if "investigation" in result and "alert_message" in result:
-            return result
+            return {**result, "gateway_status": response.status}
     except json.JSONDecodeError:
         pass
 
     print(f"[claude_investigator] could not parse Claude response ({response.text[:300]!r}), using deterministic fallback")
-    return _fallback(transaction, reasons)
+    return _fallback(transaction, reasons, response.status)

@@ -1,0 +1,20 @@
+# Secrets and local state never go into the image or the build context
+.env
+.env.*
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.pytest_cache/
+.claude/
+
+# Not needed at runtime
+test_*.py
+conftest.py
+fakes.py
+session*.py
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore

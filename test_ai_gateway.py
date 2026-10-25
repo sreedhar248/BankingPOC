@@ -1,106 +1,123 @@
 """
 Exercises the simulated APIM gateway with a fake backend and fake clock:
-no API calls, no waiting. Run: python test_ai_gateway.py
+no API calls, no waiting. Run: pytest test_ai_gateway.py
 """
 
-import json
-import os
+import threading
 from contextlib import contextmanager
 
-# Keep this test offline even on a machine with real Langfuse keys exported.
-for _name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"):
-    os.environ.pop(_name, None)
-
 import langfuse
+import pytest
+
 import tracing
-from ai_gateway import AIGateway, BackendResult
+from ai_gateway import AIGateway, RateLimitExceeded
 from claude_investigator import MODEL, investigate
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = 1000.0
-
-    def __call__(self):
-        return self.now
-
-    def advance(self, seconds):
-        self.now += seconds
-
-
-class FakeBackend:
-    def __init__(self, available=True, input_tokens=300, output_tokens=100):
-        self.calls = 0
-        self._available = available
-        self._usage = (input_tokens, output_tokens)
-
-    def available(self):
-        return self._available
-
-    def __call__(self, **_):
-        self.calls += 1
-        text = json.dumps({"investigation": "FAKE-LLM investigation", "alert_message": "FAKE-LLM alert"})
-        return BackendResult(text, *self._usage)
+from fakes import FakeBackend, FakeClock
 
 
 def txn(n):
     return {"transaction_id": f"TXN-{n}", "amount": 9800.0}
 
 
-failures = 0
-
-
-def check(label, condition):
-    global failures
-    failures += not condition
-    print(f"  {'PASS' if condition else 'FAIL'}: {label}")
-
-
 def used_llm(result):
     return result["investigation"].startswith("FAKE-LLM")
 
 
-print("=== 1. Request limit: 3 requests/min, 5 rapid calls ===")
-clock, backend = FakeClock(), FakeBackend()
-gw = AIGateway(backend, requests_per_minute=3, tokens_per_minute=1_000_000, clock=clock)
-results = [investigate(txn(i), [], [f"reason {i}"], gateway=gw) for i in range(1, 6)]
-check("calls 1-3 reached the backend", all(used_llm(r) for r in results[:3]) and backend.calls == 3)
-check("calls 4-5 were throttled and fell back cleanly (no crash)", not any(used_llm(r) for r in results[3:]))
-check("fallback still carries the flag reason", results[3]["investigation"] == "reason 4")
-clock.advance(61)
-check("after the 60s window passes, calls succeed again", used_llm(investigate(txn(6), [], ["reason 6"], gateway=gw)))
-print("  usage:", gw.usage_summary())
+def test_request_limit_throttles_then_recovers():
+    clock, backend = FakeClock(), FakeBackend()
+    gw = AIGateway(backend, requests_per_minute=3, tokens_per_minute=1_000_000, clock=clock)
 
-print("\n=== 2. Token limit: 1000 tokens/min, ~400 tokens per call, request limit high ===")
-clock, backend = FakeClock(), FakeBackend()
-gw = AIGateway(backend, requests_per_minute=100, tokens_per_minute=1000, clock=clock)
-results = [investigate(txn(i), [], [f"reason {i}"], gateway=gw) for i in range(1, 5)]
-check("first 2 calls fit in the token budget", used_llm(results[0]) and used_llm(results[1]) and backend.calls == 2)
-check("3rd call rejected by the TOKEN limit, not the request limit", gw.log[2]["limit"] == "tokens-per-minute")
-check("4th call also throttled", gw.log[3]["status"] == "throttled")
+    results = [investigate(txn(i), [], [f"reason {i}"], gateway=gw) for i in range(1, 6)]
 
-print("\n=== 3. Cache: same transaction + same reasons within the hour ===")
-clock, backend = FakeClock(), FakeBackend()
-gw = AIGateway(backend, requests_per_minute=1, tokens_per_minute=1_000_000, clock=clock)
-first = investigate(txn(1), [], ["big jump"], gateway=gw)
-second = investigate(txn(1), [], ["big jump"], gateway=gw)
-check("repeat call served from cache (backend called once)", backend.calls == 1 and second == first)
-check("cache hit not throttled even with rpm=1 (consumes no quota)", gw.log[-1]["status"] == "cache_hit")
-investigate(txn(1), [], ["different reason"], gateway=gw)
-check("different reasons = cache miss (here: throttled by rpm=1)", gw.log[-1]["status"] == "throttled")
-clock.advance(3601)
-investigate(txn(1), [], ["big jump"], gateway=gw)
-check("after the 1h TTL the entry expires and the backend is called again", backend.calls == 2)
+    assert all(used_llm(r) for r in results[:3]) and backend.calls == 3
+    assert not any(used_llm(r) for r in results[3:]), "calls 4-5 should be throttled and fall back"
+    assert [r["gateway_status"] for r in results] == ["ok", "ok", "ok", "throttled", "throttled"]
+    assert results[3]["investigation"] == "reason 4", "fallback should carry the flag reason"
 
-print("\n=== 4. No API key: fallback through the gateway ===")
-backend = FakeBackend(available=False)
-gw = AIGateway(backend, clock=FakeClock())
-result = investigate(txn(1), [], ["big jump"], gateway=gw)
-check("deterministic fallback returned, backend never called", backend.calls == 0 and result["investigation"] == "big jump")
-check("logged as no_api_key", gw.log[-1]["status"] == "no_api_key")
+    clock.advance(61)
+    assert used_llm(investigate(txn(6), [], ["reason 6"], gateway=gw)), "window passed, calls succeed again"
 
-print("\n=== 5. Langfuse tracing: off without keys, correct observations with a fake client ===")
-check("tracing is disabled when no LANGFUSE_* keys are set", not tracing.enabled() and tracing.callbacks() == [])
+
+def test_token_limit_is_separate_from_request_limit():
+    clock, backend = FakeClock(), FakeBackend()  # 300 in + 100 out = 400 tokens per call
+    gw = AIGateway(backend, requests_per_minute=100, tokens_per_minute=1000, clock=clock)
+
+    results = [investigate(txn(i), [], [f"reason {i}"], gateway=gw) for i in range(1, 5)]
+
+    assert used_llm(results[0]) and used_llm(results[1]) and backend.calls == 2
+    assert gw.log[2]["limit"] == "tokens-per-minute"
+    assert gw.log[3]["status"] == "throttled"
+
+
+def test_cache_serves_repeats_without_consuming_quota():
+    clock, backend = FakeClock(), FakeBackend()
+    gw = AIGateway(backend, requests_per_minute=1, tokens_per_minute=1_000_000, clock=clock)
+
+    first = investigate(txn(1), [], ["big jump"], gateway=gw)
+    second = investigate(txn(1), [], ["big jump"], gateway=gw)
+    assert backend.calls == 1
+    assert (first["gateway_status"], second["gateway_status"]) == ("ok", "cache_hit")
+    assert second["investigation"] == first["investigation"]
+    assert gw.log[-1]["status"] == "cache_hit", "a cache hit is not throttled even at 1 request/min"
+
+    investigate(txn(1), [], ["different reason"], gateway=gw)
+    assert gw.log[-1]["status"] == "throttled", "different reasons miss the cache (here: hits the rpm=1 limit)"
+
+    clock.advance(3601)
+    investigate(txn(1), [], ["big jump"], gateway=gw)
+    assert backend.calls == 2, "after the 1h TTL the entry expires and the backend is called again"
+
+
+def test_no_api_key_falls_back_through_the_gateway():
+    backend = FakeBackend(available=False)
+    gw = AIGateway(backend, clock=FakeClock())
+
+    result = investigate(txn(1), [], ["big jump"], gateway=gw)
+
+    assert backend.calls == 0
+    assert result["investigation"] == "big jump"
+    assert result["gateway_status"] == "no_api_key"
+    assert gw.log[-1]["status"] == "no_api_key"
+
+
+def test_throttle_can_propagate_instead_of_falling_back():
+    gw = AIGateway(FakeBackend(), requests_per_minute=1, clock=FakeClock())
+    investigate(txn(1), [], ["a"], gateway=gw)
+    with pytest.raises(RateLimitExceeded) as excinfo:
+        investigate(txn(2), [], ["b"], gateway=gw, fallback_on_throttle=False)
+    assert excinfo.value.limit_name == "requests-per-minute" and excinfo.value.retry_after > 0
+
+
+def test_concurrent_requests_are_safe_and_keep_their_own_records():
+    # Smoke test of the threaded path the HTTP API uses. The race the gateway lock guards against
+    # (a deque mutated mid-sum) is too narrow to reproduce reliably, so this does not prove the lock.
+    backend = FakeBackend(delay=0.002)  # sleep inside the call so threads interleave
+    gw = AIGateway(backend, requests_per_minute=10_000, tokens_per_minute=10_000_000, clock=FakeClock())
+    errors, mismatches = [], []
+
+    def worker(worker_id):
+        for i in range(25):
+            tid = f"TXN-{worker_id}-{i}"
+            try:
+                result = gw.invoke(
+                    transaction_id=tid, reasons=[tid], model=MODEL, system="s", user_content="u", max_tokens=10
+                )
+                if result.record["transaction_id"] != tid:
+                    mismatches.append((tid, result.record["transaction_id"]))
+            except Exception as exc:  # any crash under concurrency is a failure
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors and not mismatches
+    assert gw.usage_summary()["backend_calls"] == 200
+
+
+# ---- Langfuse tracing (fake client, no network) -------------------------------
 
 
 class Recorded:
@@ -126,40 +143,38 @@ class RecordingClient:
             raise
 
 
-client = RecordingClient()
-real_get_client, real_enabled = langfuse.get_client, tracing.enabled
-langfuse.get_client, tracing.enabled = (lambda: client), (lambda: True)
-try:
+def test_tracing_is_off_without_keys():
+    assert not tracing.enabled() and tracing.callbacks() == []
+
+
+def test_tracing_records_span_and_generation_for_every_gateway_status(monkeypatch):
+    client = RecordingClient()
+    monkeypatch.setattr(langfuse, "get_client", lambda: client)
+    monkeypatch.setattr(tracing, "enabled", lambda: True)
+
     def observed(gateway, n, reasons):
         before = len(client.observations)
         investigate(txn(n), [], reasons, gateway=gateway)
         return client.observations[before:]
 
     gw = AIGateway(FakeBackend(), requests_per_minute=1, tokens_per_minute=1_000_000, clock=FakeClock())
+
     span, generation = observed(gw, 1, ["big jump"])
-    check("ok: gateway span + claude-call generation", (span.name, generation.name) == ("ai-gateway", "claude-call"))
-    check("ok: span metadata carries gateway_status=ok and token counts",
-          span.attrs["metadata"]["gateway_status"] == "ok" and span.attrs["metadata"]["input_tokens"] == 300)
-    check("ok: generation has model, input messages, output, usage",
-          generation.as_type == "generation" and generation.attrs["model"] == MODEL
-          and generation.attrs["input"][0]["role"] == "system"
-          and generation.attrs["output"].count("FAKE-LLM") >= 1
-          and generation.attrs["usage_details"] == {"input": 300, "output": 100})
-    check("ok: generation carries a positive cost", generation.attrs["cost_details"]["total"] > 0)
+    assert (span.name, generation.name) == ("ai-gateway", "claude-call")
+    assert span.attrs["metadata"]["gateway_status"] == "ok" and span.attrs["metadata"]["input_tokens"] == 300
+    assert generation.as_type == "generation" and generation.attrs["model"] == MODEL
+    assert generation.attrs["input"][0]["role"] == "system"
+    assert "FAKE-LLM" in generation.attrs["output"]
+    assert generation.attrs["usage_details"] == {"input": 300, "output": 100}
+    assert generation.attrs["cost_details"]["total"] > 0
 
     (span,) = observed(gw, 1, ["big jump"])
-    check("cache_hit: span only, no generation", span.attrs["metadata"]["gateway_status"] == "cache_hit")
+    assert span.attrs["metadata"]["gateway_status"] == "cache_hit"
 
     (span,) = observed(gw, 1, ["different reason"])
-    check("throttled: span only, gateway_status=throttled, level=WARNING",
-          span.attrs["metadata"]["gateway_status"] == "throttled" and span.attrs["level"] == "WARNING")
-    check("throttled: not recorded as a span error", span.error is None)
+    assert span.attrs["metadata"]["gateway_status"] == "throttled" and span.attrs["level"] == "WARNING"
+    assert span.error is None, "throttling is expected, not a span error"
 
     gw = AIGateway(FakeBackend(available=False), clock=FakeClock())
     (span,) = observed(gw, 2, ["big jump"])
-    check("no_api_key: span only, gateway_status=no_api_key", span.attrs["metadata"]["gateway_status"] == "no_api_key")
-finally:
-    langfuse.get_client, tracing.enabled = real_get_client, real_enabled
-
-print(f"\n{'ALL PASSED' if not failures else f'{failures} FAILED'}")
-raise SystemExit(1 if failures else 0)
+    assert span.attrs["metadata"]["gateway_status"] == "no_api_key"

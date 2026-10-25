@@ -1,0 +1,29 @@
+# API only (in-memory mock data):   docker compose up --build
+# API + real MongoDB:               docker compose --profile mongo up --build
+#   with MONGODB_URI=mongodb://mongo:27017 and SEED_DEMO_DATA=true in .env
+#
+# Compose reads .env in this folder for the ${...} substitutions below. Nothing is baked into the image.
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      API_KEYS: ${API_KEYS:?set API_KEYS in .env (comma-separated list of keys clients must send as X-API-Key)}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      MONGODB_URI: ${MONGODB_URI:-}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-}
+      THROTTLE_FALLBACK: ${THROTTLE_FALLBACK:-true}
+      GATEWAY_RPM: ${GATEWAY_RPM:-10}
+      GATEWAY_TPM: ${GATEWAY_TPM:-20000}
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    profiles: ["mongo"]
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:

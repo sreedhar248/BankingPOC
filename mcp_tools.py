@@ -12,7 +12,7 @@ does not change as long as the tool names and schemas match.
 
 import json
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 
 class MCPServer(Protocol):
@@ -72,7 +72,9 @@ class MongoTransactionsServer:
             if name == "get_transaction":
                 doc = self._col.find_one({"transaction_id": arguments["transaction_id"]})
                 if doc is None:
-                    return _text_result({"error": f"transaction {arguments['transaction_id']} not found"}, True)
+                    return _text_result(
+                        {"error": f"transaction {arguments['transaction_id']} not found", "code": "not_found"}, True
+                    )
                 return _text_result(_clean(doc))
 
             if name == "get_payer_history":
@@ -85,6 +87,14 @@ class MongoTransactionsServer:
             return _text_result({"error": f"unknown tool {name}"}, True)
         except (KeyError, ValueError) as exc:
             return _text_result({"error": f"invalid arguments: {exc}"}, True)
+
+
+class MCPToolError(RuntimeError):
+    """A tool call that came back with isError=true. `code` is the server's machine-readable reason, if any."""
+
+    def __init__(self, tool: str, message: str, code: Optional[str] = None):
+        self.tool, self.code = tool, code
+        super().__init__(f"MCP tool '{tool}' failed: {message}")
 
 
 class MCPClient:
@@ -100,5 +110,5 @@ class MCPClient:
         result = self._server.call_tool(name, arguments)
         payload = json.loads(result["content"][0]["text"])
         if result.get("isError"):
-            raise RuntimeError(f"MCP tool '{name}' failed: {payload.get('error', payload)}")
+            raise MCPToolError(name, payload.get("error", payload), payload.get("code"))
         return payload

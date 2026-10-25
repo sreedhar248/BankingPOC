@@ -6,3 +6,7 @@ python-dotenv
 pymongo
 mongomock
 langfuse
+fastapi
+uvicorn
+httpx
+pytest
