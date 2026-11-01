@@ -29,7 +29,7 @@ if __name__ == "__main__":
         print(f"\n--- {txn_id}: {label} ---")
         with tracing.trace(name=txn_id, tags=[label], input={"transaction_id": txn_id}) as span:
             result = app.invoke({"transaction_id": txn_id}, config={"callbacks": tracing.callbacks()})
-            span.update(output={k: result[k] for k in ("is_anomalous", "reasons", "signals")})
+            span.update(output={k: result[k] for k in ("is_anomalous", "reasons", "signals", "rules")})
         ok = result["is_anomalous"] == expected
         failures += not ok
         print(f"Result: is_anomalous={result['is_anomalous']} (expected {expected}) {'PASS' if ok else 'FAIL'}")

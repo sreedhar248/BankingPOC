@@ -31,6 +31,7 @@ class AnalyzeResponse(BaseModel):
     is_anomalous: bool
     reasons: list[str]
     signals: dict
+    triggered_rules: list[dict]  # every rule that fired: {rule, severity, detail}; may be non-empty without an alert
     # The next three are null for transactions that were not flagged (Claude is never called).
     investigation: Optional[str] = None
     alert_message: Optional[str] = None
@@ -73,6 +74,7 @@ def create_app(graph=None) -> FastAPI:
             is_anomalous=result["is_anomalous"],
             reasons=result["reasons"],
             signals=result["signals"],
+            triggered_rules=result["rules"],
             investigation=result.get("investigation"),
             alert_message=result.get("alert_message"),
             gateway_status=result.get("gateway_status"),

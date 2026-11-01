@@ -132,6 +132,54 @@ def test_repeat_request_is_served_from_the_gateway_cache(make_client):
     assert backend.calls == 1
 
 
+# ---- Session 5 scenarios: every rule, end to end through the graph ------------------
+
+SCENARIOS = [
+    # txn_id, flagged?, rules that fired
+    ("TXN-1001", False, set()),
+    ("TXN-2001", False, set()),                                      # $61k, but normal for this payer
+    ("TXN-3001", True, {"baseline_spike", "new_payee_large"}),
+    ("TXN-4001", False, set()),                                      # new payer: not enough history
+    ("TXN-5001", False, {"velocity_burst"}),                         # one medium signal is not an alert
+    ("TXN-6001", True, {"structuring"}),
+    ("TXN-7001", True, {"watchlisted_payee"}),                       # tiny amount, bad payee
+    ("TXN-8001", True, {"velocity_burst", "new_payee_large"}),       # two mediums together
+    ("TXN-9001", False, set()),                                      # first payment to a new payee, normal amount
+]
+
+
+@pytest.mark.parametrize("txn_id, flagged, rules", SCENARIOS)
+def test_scenario(make_client, txn_id, flagged, rules):
+    client, _ = make_client()
+    body = analyze(client, txn_id).json()
+    assert body["is_anomalous"] is flagged
+    assert {r["rule"] for r in body["triggered_rules"]} == rules
+
+
+def test_a_signal_without_an_alert_is_visible_but_costs_nothing(make_client):
+    client, backend = make_client(FakeBackend())
+    body = analyze(client, "TXN-5001").json()
+    assert body["is_anomalous"] is False
+    assert body["triggered_rules"] == [
+        {"rule": "velocity_burst", "severity": "medium", "detail": body["triggered_rules"][0]["detail"]}
+    ]
+    assert body["signals"]["velocity"]["txn_count"] == 5
+    assert body["investigation"] is None and backend.calls == 0
+
+
+def test_watchlisted_payee_alert_explains_why(make_client):
+    client, _ = make_client()
+    body = analyze(client, "TXN-7001").json()
+    assert "PAYEE-WATCHLISTED-SHELL is on the watchlist" in body["reasons"][0]
+    assert "shell-company" in body["reasons"][0]
+
+
+def test_flagged_transaction_with_several_rules_sends_all_reasons_to_claude(make_client):
+    client, _ = make_client()
+    body = analyze(client, "TXN-8001").json()
+    assert len(body["reasons"]) == 2 and body["investigation"] == "; ".join(body["reasons"])
+
+
 # ---- errors -------------------------------------------------------------------
 
 

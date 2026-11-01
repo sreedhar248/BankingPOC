@@ -71,7 +71,7 @@ flowchart TD
     T2 --> MOCK
     MOCK -. "swap: set MONGODB_URI" .-> REAL
 
-    DET -->|"ratio = amount / avg\nz = (amount - avg) / stdev\nmin 3 prior txns"| ROUTE
+    DET -->|"detection.evaluate(): 5 rules\nany high, or 2+ medium, flags"| ROUTE
 
     subgraph CLAUDE ["Claude investigation (claude_investigator.py)"]
         ENV{ANTHROPIC_API_KEY set?}
@@ -117,9 +117,11 @@ flowchart LR
   `{"content": [...], "isError": bool}` envelope a real MCP server would
   return. Swapping `MongoTransactionsServer` for a networked MCP server
   requires no change in `ingest_transaction`.
-- **Detection thresholds** — flags when the amount is both ≥3x the
-  payer's historical average *and* ≥3 standard deviations above it, with
-  a minimum of 3 prior transactions to trust the baseline at all. Purely
+- **Detection rules** — five deterministic rules in `detection.py`:
+  `baseline_spike` (≥3x the payer's average *and* ≥3 std devs, min 3 prior
+  txns), `watchlisted_payee` and `structuring` (high severity), and
+  `velocity_burst` and `new_payee_large` (medium). A transaction is flagged
+  if any high rule fires or two medium rules fire together. Purely
   arithmetic — no model in the loop.
 - **Claude investigation** — only ever called on transactions already
   flagged by the step above. `ANTHROPIC_API_KEY` presence is the runtime

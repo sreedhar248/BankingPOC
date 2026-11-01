@@ -16,7 +16,8 @@ COLLECTION_NAME = "transactions"
 # Fixed "now" so seeded history and test scenarios are deterministic.
 REFERENCE_NOW = datetime(2026, 9, 19, 9, 0, tzinfo=timezone.utc)
 
-# payer_id -> (payer_name, [(days_ago, amount, payee_id), ...])
+# payer_id -> (payer_name, [(days_ago, amount, payee_id), ...]); days_ago may be fractional (hours / 24)
+_H = 1 / 24
 _PAYER_HISTORY = {
     "PAY-1001": ("Sarah Nguyen", [
         (58, 45.00, "PAYEE-COFFEE"), (51, 120.00, "PAYEE-GROCER"), (44, 310.00, "PAYEE-RENT-SHARE"),
@@ -35,6 +36,40 @@ _PAYER_HISTORY = {
     "PAY-4001": ("Priya Raman", [
         (12, 300.00, "PAYEE-FRIEND"),
     ]),
+    # Four payments in the last 24h to known payees, normal amounts: velocity_burst only.
+    "PAY-5001": ("Dana Okafor", [
+        (42, 410.00, "PAYEE-GYM"), (35, 430.00, "PAYEE-GROCER"), (28, 400.00, "PAYEE-GYM"),
+        (21, 450.00, "PAYEE-GROCER"), (14, 420.00, "PAYEE-GYM"),
+        (20 * _H, 440.00, "PAYEE-GROCER"), (14 * _H, 460.00, "PAYEE-GYM"),
+        (9 * _H, 430.00, "PAYEE-GROCER"), (4 * _H, 470.00, "PAYEE-GYM"),
+    ]),
+    # Business that normally pays ~$8k, then two $9.5k+ payments in 30h: structuring only.
+    "PAY-6001": ("Lena Fischer", [
+        (56, 7_800.00, "PAYEE-SUPPLIER"), (49, 8_200.00, "PAYEE-SUPPLIER"), (42, 8_600.00, "PAYEE-SUPPLIER"),
+        (35, 8_100.00, "PAYEE-SUPPLIER"), (28, 8_400.00, "PAYEE-SUPPLIER"),
+        (30 * _H, 9_500.00, "PAYEE-SUPPLIER"), (12 * _H, 9_700.00, "PAYEE-SUPPLIER"),
+    ]),
+    # Small, regular payments; the current one goes to a watchlisted payee.
+    "PAY-7001": ("Tom Bradley", [
+        (35, 180.00, "PAYEE-COFFEE"), (28, 220.00, "PAYEE-GROCER"), (21, 150.00, "PAYEE-COFFEE"),
+        (14, 260.00, "PAYEE-GROCER"), (7, 200.00, "PAYEE-COFFEE"),
+    ]),
+    # ~$600 payer: 3 payments in the last 24h, then 2.5x the average to a first-time payee.
+    "PAY-8001": ("Imran Qureshi", [
+        (50, 560.00, "PAYEE-LANDLORD"), (43, 610.00, "PAYEE-GROCER"), (36, 590.00, "PAYEE-LANDLORD"),
+        (29, 640.00, "PAYEE-GROCER"), (22, 575.00, "PAYEE-LANDLORD"), (15, 620.00, "PAYEE-GROCER"),
+        (20 * _H, 580.00, "PAYEE-GROCER"), (10 * _H, 610.00, "PAYEE-LANDLORD"), (3 * _H, 640.00, "PAYEE-GROCER"),
+    ]),
+    # Ordinary first payment to a new payee at a normal amount: must stay clean.
+    "PAY-9001": ("Aiko Tanaka", [
+        (40, 95.00, "PAYEE-CAFE"), (33, 120.00, "PAYEE-GROCER"), (26, 110.00, "PAYEE-CAFE"),
+        (19, 130.00, "PAYEE-GROCER"), (12, 100.00, "PAYEE-CAFE"),
+    ]),
+}
+
+# payee_id -> reason. Only watchlisted payees have a record; any other payee is treated as not watchlisted.
+_WATCHLIST = {
+    "PAYEE-WATCHLISTED-SHELL": "beneficiary linked to previously reported shell-company activity",
 }
 
 # Transactions to be analysed (the "current" event), newest in the collection.
@@ -43,6 +78,11 @@ _CURRENT = [
     ("TXN-2001", "PAY-2001", 61_000.00, "PAYEE-FLEET-LEASE"),
     ("TXN-3001", "PAY-3001", 9_800.00, "PAYEE-NEW-OFFSHORE"),
     ("TXN-4001", "PAY-4001", 5_000.00, "PAYEE-UNKNOWN"),
+    ("TXN-5001", "PAY-5001", 450.00, "PAYEE-GROCER"),
+    ("TXN-6001", "PAY-6001", 9_900.00, "PAYEE-SUPPLIER"),
+    ("TXN-7001", "PAY-7001", 250.00, "PAYEE-WATCHLISTED-SHELL"),
+    ("TXN-8001", "PAY-8001", 1_500.00, "PAYEE-NEW-CONTACT"),
+    ("TXN-9001", "PAY-9001", 120.00, "PAYEE-NEW-BAKERY"),
 ]
 
 
@@ -75,6 +115,9 @@ def seed(collection) -> None:
             "timestamp": REFERENCE_NOW,
         })
     collection.insert_many(docs)
+    collection.database["payees"].insert_many(
+        [{"payee_id": pid, "watchlisted": True, "reason": reason} for pid, reason in _WATCHLIST.items()]
+    )
     collection.create_index("transaction_id", unique=True)
     collection.create_index([("payer_id", 1), ("timestamp", -1)])
 

@@ -37,6 +37,7 @@ class MongoTransactionsServer:
 
     def __init__(self, collection):
         self._col = collection
+        self._payees = collection.database["payees"]
 
     def list_tools(self) -> list[dict]:
         return [
@@ -65,6 +66,18 @@ class MongoTransactionsServer:
                     "required": ["payer_id"],
                 },
             },
+            {
+                "name": "get_payee_profile",
+                "description": (
+                    "Fetch the risk profile of a payee: whether it is on the watchlist and why. "
+                    "A payee with no record is returned as not watchlisted."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"payee_id": {"type": "string"}},
+                    "required": ["payee_id"],
+                },
+            },
         ]
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -83,6 +96,10 @@ class MongoTransactionsServer:
                     query["timestamp"] = {"$lt": datetime.fromisoformat(arguments["before"])}
                 cursor = self._col.find(query).sort("timestamp", -1).limit(int(arguments.get("limit", 50)))
                 return _text_result([_clean(d) for d in cursor])
+
+            if name == "get_payee_profile":
+                doc = self._payees.find_one({"payee_id": arguments["payee_id"]})
+                return _text_result(_clean(doc) if doc else {"payee_id": arguments["payee_id"], "watchlisted": False})
 
             return _text_result({"error": f"unknown tool {name}"}, True)
         except (KeyError, ValueError) as exc:

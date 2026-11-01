@@ -10,7 +10,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # Runtime modules only: no tests, session runners, or .env (secrets come from the environment at run time).
-COPY agent.py api.py ai_gateway.py claude_investigator.py mcp_tools.py mongo_db.py tracing.py ./
+COPY agent.py api.py ai_gateway.py claude_investigator.py detection.py mcp_tools.py mongo_db.py tracing.py ./
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser

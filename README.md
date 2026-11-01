@@ -41,8 +41,13 @@ to `agent.py` (the session scripts are thin runners), `api.py` exposes it over
 HTTP with API-key auth, and a `Dockerfile` + `docker-compose.yml` package it. See
 [Session 7: deployable service](#session-7-deployable-service).
 
+**Session 5 (complete):** more deterministic signals beyond the amount-vs-average check:
+velocity, counterparty risk (new and watchlisted payees) and structuring. Five explainable rules
+in `detection.py`, combined by a simple severity rule. See
+[Session 5: detection rules](#session-5-detection-rules). (Numbered 5 because it was the
+next item; by the original roadmap Session 5 was Kong, which is still open.)
+
 **Still planned:**
-- Additional deterministic signals: velocity, counterparty risk, pattern matching
 - Kong
 - Full end-to-end POC build
 
@@ -98,6 +103,7 @@ pip install -r requirements.txt
 python session1_langgraph_basics.py
 python session2_langgraph_mcp.py
 python session3_langgraph_claude.py
+python session5_signals.py   # nine scenarios, every detection rule
 pytest                      # all tests; keyless and offline (no API calls)
 ```
 
@@ -169,6 +175,62 @@ no API calls and doesn't wait a real minute:
 The Session 3 scenarios run unchanged through the gateway against the real
 Claude API (TXN-3001: ~1,100 input / ~220 output tokens, about $0.007 at the
 placeholder Sonnet rates).
+
+## Session 5: detection rules
+
+Until now a transaction was flagged only if its amount was far above the payer's own average.
+`detection.py` adds three more kinds of signal. It is pure functions with no I/O and no LLM, so each
+rule is unit tested on its own, and an alert can be explained by naming the rules that fired.
+
+| Rule | Severity | Fires when | Why it matters |
+|---|---|---|---|
+| `baseline_spike` | high | amount is at least 3x the payer's average **and** 3 std devs above it (needs 3+ prior txns) | the Session 2 check, unchanged |
+| `watchlisted_payee` | high | the payee is on the watchlist | a tiny payment to a bad counterparty still matters; works even with no history |
+| `structuring` | high | the current payment is in $9,000-$9,999.99 and there are 3+ such payments (counting this one) in 48h | repeated payments just under a reporting threshold look like deliberate splitting |
+| `velocity_burst` | medium | 4+ payments from this payer in 24h, counting this one | normal amounts, abnormal pace |
+| `new_payee_large` | medium | first payment to this payee, and at least 2x the payer's average (needs 3+ prior txns) | a new payee is normal; a new payee for a lot more than usual is not |
+
+**Decision rule:** flag if **any high** rule fires, or **two or more medium** rules fire together.
+A single medium rule is recorded in `triggered_rules` but does not alert, so a first payment to a new
+payee, or a busy day, doesn't raise a false alarm by itself. There are no weights and no score to tune.
+
+**Wiring.** `ingest_transaction` now also fetches the payee's profile through a new MCP tool,
+`get_payee_profile`, backed by a `payees` collection (the watchlist), so counterparty data goes through the
+same tool contract as everything else. `detect_anomaly` hands transaction, history and profile to
+`detection.evaluate()`. The `signals` block gains `velocity`, `counterparty` and `pattern` sub-objects and the
+state gains `rules`; the earlier flat keys (`avg`, `std`, `ratio`, `z_score`, ...) are unchanged.
+
+`python session5_signals.py` runs nine scenarios and checks the verdict **and** which rules fired:
+
+| Transaction | Scenario | Rules fired | Result |
+|---|---|---|---|
+| TXN-1001 | normal retail payment | none | clean |
+| TXN-2001 | $61k, normal for this business payer | none | clean |
+| TXN-3001 | $9.8k from a ~$900 payer to a new payee | `baseline_spike`, `new_payee_large` | **flagged** |
+| TXN-4001 | new payer, 1 prior txn | none | clean (no baseline) |
+| TXN-5001 | 5th payment in 24h, normal amounts | `velocity_burst` | clean: one medium signal |
+| TXN-6001 | third payment in 48h just under $10,000 | `structuring` | **flagged** |
+| TXN-7001 | $250 to a watchlisted payee | `watchlisted_payee` | **flagged** |
+| TXN-8001 | burst of payments, then 2.5x average to a new payee | `velocity_burst`, `new_payee_large` | **flagged**: two mediums |
+| TXN-9001 | first payment to a new payee, normal amount | none | clean |
+
+TXN-5001 and TXN-9001 are deliberate negative controls: a signal on its own must not alert.
+
+`test_detection.py` covers each rule and its boundaries (the exact velocity limit and window edge, the inclusive
+band floor, the exclusive threshold, zero-variance history) with synthetic data. To check the tests can fail,
+four deliberate bugs were injected into the rules (an off-by-one on the velocity limit, the structuring band's
+upper edge, the one-medium decision, the window edge) and each was caught.
+
+**Known gaps:**
+
+- **Thresholds are illustrative, not calibrated.** Nothing here was tuned or validated against real
+  transactions, so the false-positive and false-negative rates are unknown. The $10,000 structuring figure mirrors the
+  cash reporting-threshold convention; real typologies and limits need a compliance team's sign-off.
+- **Fan-out** (one payer paying many different payees quickly) is not implemented.
+- **Per-payer only:** no cross-payer view, so mule accounts and coordinated activity are invisible.
+- **"First-time payee" looks back at most 50 prior transactions**, so a payee paid long ago can look new.
+- **The watchlist is a mock** with a single entry; there is no screening against a real sanctions or fraud list.
+- **Thresholds are constants in `detection.py`,** not configuration.
 
 ## Session 6: Langfuse tracing
 
@@ -256,7 +318,7 @@ remain standalone teaching scripts.
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `GET /healthz` | none | Liveness probe: `{"status": "ok"}` |
-| `POST /analyze` | `X-API-Key` | `{"transaction_id": "..."}` returns `is_anomalous`, `reasons`, `signals`, `investigation`, `alert_message`, `gateway_status` |
+| `POST /analyze` | `X-API-Key` | `{"transaction_id": "..."}` returns `is_anomalous`, `reasons`, `signals`, `triggered_rules`, `investigation`, `alert_message`, `gateway_status` |
 
 `investigation`, `alert_message` and `gateway_status` are `null` for transactions that
 were not flagged (Claude is never called for them). `gateway_status` is
@@ -319,9 +381,16 @@ Response for TXN-3001 (no Anthropic key configured, so the deterministic fallbac
 ```json
 {
   "is_anomalous": true,
-  "reasons": ["amount $9,800.00 is 10.6x payer average $923.33 (43.0 std devs above, n=6)"],
-  "signals": {"amount": 9800.0, "history_count": 6, "avg": 923.33, "std": 206.61, "ratio": 10.61, "z_score": 42.96, "...": "..."},
-  "investigation": "amount $9,800.00 is 10.6x payer average $923.33 (43.0 std devs above, n=6)",
+  "reasons": [
+    "amount $9,800.00 is 10.6x payer average $923.33 (43.0 std devs above, n=6)",
+    "first payment to PAYEE-NEW-OFFSHORE, and amount $9,800.00 is 10.6x payer average $923.33"
+  ],
+  "signals": {"amount": 9800.0, "history_count": 6, "avg": 923.33, "std": 206.61, "ratio": 10.61, "z_score": 42.96, "velocity": {"...": "..."}, "counterparty": {"...": "..."}, "pattern": {"...": "..."}},
+  "triggered_rules": [
+    {"rule": "baseline_spike", "severity": "high", "detail": "amount $9,800.00 is 10.6x payer average ..."},
+    {"rule": "new_payee_large", "severity": "medium", "detail": "first payment to PAYEE-NEW-OFFSHORE, and ..."}
+  ],
+  "investigation": "amount $9,800.00 is 10.6x payer average $923.33 (...); first payment to PAYEE-NEW-OFFSHORE, ...",
   "alert_message": "ALERT: transaction TXN-3001 ($9,800.00) flagged as anomalous \u2014 amount $9,800.00 is 10.6x ...",
   "gateway_status": "no_api_key"
 }
@@ -364,9 +433,9 @@ curl -s -w " %{http_code}\n" -X POST localhost:8000/analyze -H "Content-Type: ap
 
 | Check | Result |
 |---|---|
-| `pytest` (keyless, offline) | 26 tests pass: auth (missing, wrong, second key, fail-closed), clean and insufficient-history verdicts, anomalous with and without a Claude key, cache hit, 404, 422, throttle fallback, 429 with `Retry-After`, plus the existing gateway and tracing tests |
+| `pytest` (keyless, offline) | 26 tests passed at the time (61 after Session 5): auth (missing, wrong, second key, fail-closed), clean and insufficient-history verdicts, anomalous with and without a Claude key, cache hit, 404, 422, throttle fallback, 429 with `Retry-After`, plus the existing gateway and tracing tests |
 | `docker build` | non-root `appuser`, runtime modules only, no `.env` in the image |
 | `docker run`, then `curl /analyze` for TXN-3001 | `200`, `is_anomalous: true`, `gateway_status: "no_api_key"`; no key `401`; unknown id `404`; healthcheck `healthy` |
 | 60 parallel requests against the container | 40 `200`, 20 expected `404`, no `500`s, no tracebacks |
-| `docker compose --profile mongo up` | 25 demo documents seeded into real MongoDB, TXN-3001 anomalous through it, restart did not re-seed |
+| `docker compose --profile mongo up` | the demo documents (25 at the time) seeded into real MongoDB, TXN-3001 anomalous through it, restart did not re-seed |
 | `docker compose up` with a real Anthropic key | TXN-3001 `gateway_status: "ok"` with Claude's investigation, repeat call `cache_hit` |
